@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index.py" },
+    { "source": "/assets/(.*)", "destination": "/dist/assets/$1" },
+    { "source": "/app.js", "destination": "/dist/app.js" },
+    { "source": "/app.css", "destination": "/dist/app.css" },
+    { "source": "/config.js", "destination": "/dist/config.js" },
+    { "source": "/demo.js", "destination": "/dist/demo.js" },
+    { "source": "/(.*)", "destination": "/dist/index.html" }
+  ]
+}

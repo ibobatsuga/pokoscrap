@@ -1,0 +1,10 @@
+.env
+.venv/
+runtime/
+backups/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.tar.gz
+.vercel
+
