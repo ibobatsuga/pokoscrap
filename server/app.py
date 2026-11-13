@@ -120,13 +120,25 @@ def login(request: Request, response: Response, body: dict = Body(...)):
         if not user or not user['active'] or not user['verified'] or not valid:
             raise HTTPException(401, 'Email atau kata sandi tidak valid, atau email belum diverifikasi.')
         membership = conn.execute(db.memberships.select().where(db.memberships.c.user_id == user['id'], db.memberships.c.active == True).limit(1)).mappings().first()
-        token = secrets.token_urlsafe(48)
-        conn.execute(db.sessions.insert().values(id=hashlib.sha256(token.encode()).hexdigest(), user_id=user['id'], tenant_id=membership['tenant_id'] if membership else None, last_seen=now(), expires=(datetime.now(timezone.utc)+timedelta(days=7)).isoformat()))
+        org = db.one(conn, db.organizations, db.organizations.c.id == membership['tenant_id']) if membership else None
+        from .saas import make_jwt
+        jwt_token = make_jwt({
+            'id': user['id'],
+            'name': user['name'],
+            'email': user['email'],
+            'roles': membership['roles'] if membership else ['Owner'],
+            'active': True,
+            'platform_admin': bool(user.get('platform_admin')),
+            'tenant_id': org['id'] if org else None,
+            'organization_name': org['name'] if org else '',
+            'exp': time.time() + 604800
+        })
+        conn.execute(db.sessions.insert().values(id=hashlib.sha256(jwt_token.encode()).hexdigest(), user_id=user['id'], tenant_id=membership['tenant_id'] if membership else None, last_seen=now(), expires=(datetime.now(timezone.utc)+timedelta(days=7)).isoformat()))
         conn.execute(db.platform_audit.insert().values(id=db.uid(), actor=user['name'], tenant_id=membership['tenant_id'] if membership else None, type='login', reason='Login terverifikasi', created_at=now(), payload={}))
         login_attempts.pop(key, None)
-        response.set_cookie('poko_session', token, httponly=True, samesite='strict', secure=os.getenv('COOKIE_SECURE') == '1', max_age=604800)
-        org = db.one(conn, db.organizations, db.organizations.c.id == membership['tenant_id']) if membership else None
-        return {**public_user(user), 'roles': membership['roles'] if membership else [], 'tenant_id': org['id'] if org else None, 'organization_name': org['name'] if org else ''}
+        secure_cookie = request.url.scheme == 'https' or os.getenv('COOKIE_SECURE') == '1' or request.headers.get('x-forwarded-proto') == 'https'
+        response.set_cookie('poko_session', jwt_token, httponly=True, samesite='lax', secure=secure_cookie, path='/', max_age=604800)
+        return {**public_user(user), 'roles': membership['roles'] if membership else [], 'tenant_id': org['id'] if org else None, 'organization_name': org['name'] if org else '', 'token': jwt_token}
 
 
 @app.get('/api/me')

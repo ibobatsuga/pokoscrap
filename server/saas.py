@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -21,10 +22,113 @@ BASE_URL = os.getenv('BASE_URL', 'http://127.0.0.1:8877').rstrip('/')
 api_requests = {}
 
 
+def make_jwt(payload: dict) -> str:
+    secret = (os.getenv('AUTH_SECRET') or os.getenv('GOOGLE_CLIENT_SECRET') or 'pokoscrap-secret-key-2026').encode()
+    header = base64.urlsafe_b64encode(json.dumps({'alg': 'HS256', 'typ': 'JWT'}).encode()).rstrip(b'=').decode()
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+    signing_input = f"{header}.{payload_b64}".encode()
+    sig = base64.urlsafe_b64encode(hmac.new(secret, signing_input, hashlib.sha256).digest()).rstrip(b'=').decode()
+    return f"{header}.{payload_b64}.{sig}"
+
+
+def verify_jwt(token: str) -> dict | None:
+    if not token or token.count('.') != 2:
+        return None
+    try:
+        h, p, s = token.split('.')
+        secret = (os.getenv('AUTH_SECRET') or os.getenv('GOOGLE_CLIENT_SECRET') or 'pokoscrap-secret-key-2026').encode()
+        expected = base64.urlsafe_b64encode(hmac.new(secret, f"{h}.{p}".encode(), hashlib.sha256).digest()).rstrip(b'=').decode()
+        if not hmac.compare_digest(s, expected):
+            return None
+        p += '=' * ((4 - len(p) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(p.encode()).decode())
+        if data.get('exp', 0) < time.time():
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def ensure_jwt_user_in_db(conn, jwt_user):
+    user = db.one(conn, db.users, db.users.c.id == jwt_user['id'])
+    if not user:
+        user_record = {
+            'id': jwt_user['id'],
+            'name': jwt_user['name'],
+            'email': jwt_user['email'],
+            'password_hash': 'oauth:google',
+            'roles': jwt_user.get('roles', ['Owner']),
+            'active': True,
+            'verified': True,
+            'platform_admin': jwt_user.get('platform_admin', False)
+        }
+        conn.execute(db.users.insert().values(**{k: v for k, v in user_record.items() if k in db.users.c}))
+    tenant_id = jwt_user.get('tenant_id')
+    if tenant_id:
+        org = db.one(conn, db.organizations, db.organizations.c.id == tenant_id)
+        if not org:
+            conn.execute(db.organizations.insert().values(
+                id=tenant_id,
+                name=jwt_user.get('organization_name') or 'Workspace Utama',
+                owner_id=jwt_user['id'],
+                status='active',
+                created_at=now()
+            ))
+            conn.execute(db.memberships.insert().values(
+                id=db.uid(),
+                tenant_id=tenant_id,
+                user_id=jwt_user['id'],
+                roles=jwt_user.get('roles', ['Owner']),
+                active=True
+            ))
+            conn.execute(db.subscriptions.insert().values(
+                tenant_id=tenant_id,
+                plan_code='free',
+                status='active',
+                period_start=now(),
+                period_end=None,
+                next_plan=None,
+                grace_until=None
+            ))
+            conn.execute(db.ledger.insert().values(
+                id=db.uid(),
+                tenant_id=tenant_id,
+                type='grant',
+                amount=30,
+                balance_after=30,
+                reference='initial-grant',
+                actor='Sistem',
+                created_at=now()
+            ))
+
+
+def check_jwt_user_active_and_valid(conn, jwt_user):
+    ensure_jwt_user_in_db(conn, jwt_user)
+    user = db.one(conn, db.users, db.users.c.id == jwt_user['id'])
+    if not user or not user['active'] or not user['verified']:
+        return None
+    tenant_id = jwt_user.get('tenant_id')
+    if tenant_id:
+        member = db.one(conn, db.memberships, (db.memberships.c.tenant_id == tenant_id) & (db.memberships.c.user_id == user['id']) & (db.memberships.c.active == True))
+        if not member:
+            return None
+        org = db.one(conn, db.organizations, db.organizations.c.id == tenant_id)
+        if org and org['status'] == 'suspended':
+            return None
+        return {**jwt_user, 'roles': member['roles'], 'organization_name': org['name'] if org else ''}
+    return jwt_user
+
+
 def resolve_session(request):
     authorization = request.headers.get('Authorization', '')
     if authorization.startswith('Bearer '):
-        key_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
+        candidate = authorization[7:].strip()
+        jwt_user = verify_jwt(candidate)
+        if jwt_user:
+            with db.transaction(unscoped=True) as conn:
+                return check_jwt_user_active_and_valid(conn, jwt_user)
+
+        key_hash = hashlib.sha256(candidate.encode()).hexdigest()
         with db.transaction(unscoped=True) as conn:
             key = db.one(conn, db.api_tokens, (db.api_tokens.c.id == key_hash) & (db.api_tokens.c.active == True))
             if not key:
@@ -42,26 +146,37 @@ def resolve_session(request):
                 return None
             api_requests[key_hash] = recent+[time.time()]
             return {'id': user['id'], 'name': user['name'], 'email': user['email'], 'roles': [r for r in member['roles'] if r in ('Operator', 'Reviewer')]+(['Operator'] if any(r in member['roles'] for r in ('Owner', 'Admin')) else []), 'active': True, 'platform_admin': False, 'tenant_id': org['id'], 'organization_name': org['name'], 'api_key': True}
-    hashed = hashlib.sha256(request.cookies.get('poko_session', '').encode()).hexdigest()
-    with db.transaction(unscoped=True) as conn:
-        session = db.one(conn, db.sessions, db.sessions.c.id == hashed)
-        if not session or session['expires'] < now():
-            return None
-        user = db.one(conn, db.users, db.users.c.id == session['user_id'])
-        if not user or not user['active'] or not user['verified']:
-            return None
-        member = db.one(conn, db.memberships, (db.memberships.c.tenant_id == session['tenant_id']) & (db.memberships.c.user_id == user['id']) & (db.memberships.c.active == True)) if session['tenant_id'] else None
-        if session['tenant_id'] and not member:
-            return None
-        cfg = db.one(conn, db.settings, (db.settings.c.tenant_id == session['tenant_id']) & (db.settings.c.id == 'main')) if member else None
-        idle = (cfg or {}).get('payload', {}).get('session_idle_minutes', 60)
-        if session['last_seen'] < (datetime.now(timezone.utc)-timedelta(minutes=idle)).isoformat():
-            return None
-        org = db.one(conn, db.organizations, db.organizations.c.id == session['tenant_id']) if member else None
-        if org and org['status'] == 'suspended':
-            return None
-        conn.execute(db.sessions.update().where(db.sessions.c.id == hashed).values(last_seen=now()))
-        return {'id': user['id'], 'name': user['name'], 'email': user['email'], 'roles': member['roles'] if member else [], 'active': True, 'platform_admin': bool(user['platform_admin']), 'tenant_id': org['id'] if org else None, 'organization_name': org['name'] if org else ''}
+
+    cookie_val = request.cookies.get('poko_session', '')
+    if cookie_val:
+        jwt_user = verify_jwt(cookie_val)
+        if jwt_user:
+            with db.transaction(unscoped=True) as conn:
+                return check_jwt_user_active_and_valid(conn, jwt_user)
+
+        hashed = hashlib.sha256(cookie_val.encode()).hexdigest()
+        with db.transaction(unscoped=True) as conn:
+            session = db.one(conn, db.sessions, db.sessions.c.id == hashed)
+            if not session or session['expires'] < now():
+                return None
+            user = db.one(conn, db.users, db.users.c.id == session['user_id'])
+            if not user or not user['active'] or not user['verified']:
+                return None
+            member = db.one(conn, db.memberships, (db.memberships.c.tenant_id == session['tenant_id']) & (db.memberships.c.user_id == user['id']) & (db.memberships.c.active == True)) if session['tenant_id'] else None
+            if session['tenant_id'] and not member:
+                return None
+            cfg = db.one(conn, db.settings, (db.settings.c.tenant_id == session['tenant_id']) & (db.settings.c.id == 'main')) if member else None
+            idle = (cfg or {}).get('payload', {}).get('session_idle_minutes', 60)
+            if session['last_seen'] < (datetime.now(timezone.utc)-timedelta(minutes=idle)).isoformat():
+                return None
+            org = db.one(conn, db.organizations, db.organizations.c.id == session['tenant_id']) if member else None
+            if org and org['status'] == 'suspended':
+                return None
+            conn.execute(db.sessions.update().where(db.sessions.c.id == hashed).values(last_seen=now()))
+            return {'id': user['id'], 'name': user['name'], 'email': user['email'], 'roles': member['roles'] if member else [], 'active': True, 'platform_admin': bool(user['platform_admin']), 'tenant_id': org['id'] if org else None, 'organization_name': org['name'] if org else ''}
+
+    return None
+
 
 
 def balance(conn):
@@ -265,7 +380,7 @@ def install(app):
             conn.execute(db.tokens.delete().where(db.tokens.c.user_id == token['user_id'], db.tokens.c.type == 'reset'))
         return {'ok': True}
 
-    def _login_or_register_google_user(conn, email, name, google_id, avatar_url, response):
+    def _login_or_register_google_user(conn, email, name, google_id, avatar_url, response, request=None):
         from .app import public_user
         email = email.lower()
         name = name or email.split('@')[0].capitalize()
@@ -303,9 +418,20 @@ def install(app):
             else:
                 org = db.one(conn, db.organizations, db.organizations.c.id == membership['tenant_id'])
 
-        token = secrets.token_urlsafe(48)
+        jwt_token = make_jwt({
+            'id': user['id'],
+            'name': user['name'],
+            'email': user['email'],
+            'roles': membership['roles'] if membership else ['Owner'],
+            'active': True,
+            'platform_admin': bool(user.get('platform_admin')),
+            'tenant_id': org['id'] if org else None,
+            'organization_name': org['name'] if org else '',
+            'exp': time.time() + 604800
+        })
+
         conn.execute(db.sessions.insert().values(
-            id=hashlib.sha256(token.encode()).hexdigest(),
+            id=hashlib.sha256(jwt_token.encode()).hexdigest(),
             user_id=user['id'],
             tenant_id=membership['tenant_id'],
             last_seen=now(),
@@ -321,12 +447,15 @@ def install(app):
             payload={'email': email, 'google_id': google_id}
         ))
 
-        response.set_cookie('poko_session', token, httponly=True, samesite='strict', secure=os.getenv('COOKIE_SECURE') == '1', max_age=604800)
+        if response is not None and hasattr(response, 'set_cookie'):
+            secure_cookie = os.getenv('COOKIE_SECURE') == '1' or (hasattr(request, 'url') and request.url.scheme == 'https') or (hasattr(request, 'headers') and request.headers.get('x-forwarded-proto') == 'https')
+            response.set_cookie('poko_session', jwt_token, httponly=True, samesite='lax', secure=secure_cookie, path='/', max_age=604800)
         return {
             **public_user(user),
             'roles': membership['roles'] if membership else ['Owner'],
             'tenant_id': org['id'] if org else None,
-            'organization_name': org['name'] if org else ''
+            'organization_name': org['name'] if org else '',
+            'token': jwt_token
         }
 
     @app.get('/api/auth/google/url')
@@ -382,10 +511,24 @@ def install(app):
         google_id = profile.get('sub')
         avatar_url = profile.get('picture')
 
-        from fastapi.responses import RedirectResponse
-        redir = RedirectResponse(url='/', status_code=302)
         with db.transaction(unscoped=True) as conn:
-            _login_or_register_google_user(conn, email, name, google_id, avatar_url, redir)
+            user_data = _login_or_register_google_user(conn, email, name, google_id, avatar_url, None, request)
+            jwt_token = user_data['token']
+
+        html = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Mengalihkan...</title></head>
+<body>
+<p style="font-family: sans-serif; text-align: center; margin-top: 50px;">Berhasil masuk. Mengalihkan ke workspace...</p>
+<script>
+  try {{ localStorage.setItem('poko_session', {json.dumps(jwt_token)}); }} catch(e) {{}}
+  window.location.replace('/');
+</script>
+</body>
+</html>"""
+        redir = Response(content=html, media_type="text/html")
+        secure_cookie = os.getenv('COOKIE_SECURE') == '1' or request.url.scheme == 'https' or request.headers.get('x-forwarded-proto') == 'https'
+        redir.set_cookie('poko_session', jwt_token, httponly=True, samesite='lax', secure=secure_cookie, path='/', max_age=604800)
         return redir
 
     @app.post('/api/auth/google')
@@ -422,7 +565,7 @@ def install(app):
             raise HTTPException(422, 'Email Google valid diperlukan.')
 
         with db.transaction(unscoped=True) as conn:
-            return _login_or_register_google_user(conn, email, name, google_id, avatar_url, response)
+            return _login_or_register_google_user(conn, email, name, google_id, avatar_url, response, request)
 
 
     @app.post('/api/billing/sandbox-upgrade')
