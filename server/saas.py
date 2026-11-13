@@ -265,17 +265,128 @@ def install(app):
             conn.execute(db.tokens.delete().where(db.tokens.c.user_id == token['user_id'], db.tokens.c.type == 'reset'))
         return {'ok': True}
 
+    def _login_or_register_google_user(conn, email, name, google_id, avatar_url, response):
+        from .app import public_user
+        email = email.lower()
+        name = name or email.split('@')[0].capitalize()
+
+        user = db.one(conn, db.users, db.users.c.email == email)
+        if not user:
+            user_id = db.uid()
+            user = {
+                'id': user_id,
+                'name': name,
+                'email': email,
+                'password_hash': password_hash(secrets.token_urlsafe(32)),
+                'roles': ['Owner'],
+                'active': True,
+                'verified': True,
+                'platform_admin': False
+            }
+            user_record = {**user, 'google_id': google_id, 'avatar_url': avatar_url}
+            insert_data = {k: v for k, v in user_record.items() if k in db.users.c}
+            conn.execute(db.users.insert().values(**insert_data))
+            org_display_name = f"Workspace {name.split()[0]}" if name else "Workspace Utama"
+            org = create_org(conn, user, org_display_name)
+            membership = {'tenant_id': org['id'], 'roles': ['Owner']}
+        else:
+            update_vals = {'verified': True, 'active': True}
+            if 'google_id' in db.users.c and google_id:
+                update_vals['google_id'] = google_id
+            if 'avatar_url' in db.users.c and avatar_url:
+                update_vals['avatar_url'] = avatar_url
+            conn.execute(db.users.update().where(db.users.c.id == user['id']).values(**update_vals))
+            membership = conn.execute(db.memberships.select().where(db.memberships.c.user_id == user['id'], db.memberships.c.active == True).limit(1)).mappings().first()
+            if not membership:
+                org = create_org(conn, user, f"Workspace {user['name'].split()[0] if user['name'] else 'Poko'}")
+                membership = {'tenant_id': org['id'], 'roles': ['Owner']}
+            else:
+                org = db.one(conn, db.organizations, db.organizations.c.id == membership['tenant_id'])
+
+        token = secrets.token_urlsafe(48)
+        conn.execute(db.sessions.insert().values(
+            id=hashlib.sha256(token.encode()).hexdigest(),
+            user_id=user['id'],
+            tenant_id=membership['tenant_id'],
+            last_seen=now(),
+            expires=(datetime.now(timezone.utc)+timedelta(days=7)).isoformat()
+        ))
+        conn.execute(db.platform_audit.insert().values(
+            id=db.uid(),
+            actor=user['name'],
+            tenant_id=membership['tenant_id'],
+            type='login_google',
+            reason='Login Google terverifikasi',
+            created_at=now(),
+            payload={'email': email, 'google_id': google_id}
+        ))
+
+        response.set_cookie('poko_session', token, httponly=True, samesite='strict', secure=os.getenv('COOKIE_SECURE') == '1', max_age=604800)
+        return {
+            **public_user(user),
+            'roles': membership['roles'] if membership else ['Owner'],
+            'tenant_id': org['id'] if org else None,
+            'organization_name': org['name'] if org else ''
+        }
+
     @app.get('/api/auth/google/url')
-    def google_auth_url():
+    def google_auth_url(request: Request):
         client_id = os.getenv('GOOGLE_CLIENT_ID', '')
-        redirect_uri = f"{BASE_URL}/api/auth/google/callback"
+        proto = request.headers.get('x-forwarded-proto', 'https')
+        host = request.headers.get('x-forwarded-host') or request.headers.get('host') or ''
+        base = f"{proto}://{host}" if host else BASE_URL
+        redirect_uri = f"{base}/api/auth/google/callback"
         configured = bool(client_id)
         auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope=openid%20email%20profile&access_type=offline&prompt=consent" if configured else ""
         return {
             'configured': configured,
             'client_id': client_id,
-            'auth_url': auth_url
+            'auth_url': auth_url,
+            'redirect_uri': redirect_uri
         }
+
+    @app.get('/api/auth/google/callback')
+    async def google_auth_callback(request: Request, response: Response, code: str = '', error: str = ''):
+        if error or not code:
+            return Response(content="<script>alert('Login Google dibatalkan atau gagal.'); location.href='/';</script>", media_type="text/html")
+        client_id = os.getenv('GOOGLE_CLIENT_ID', '')
+        client_secret = os.getenv('GOOGLE_CLIENT_SECRET', '')
+        proto = request.headers.get('x-forwarded-proto', 'https')
+        host = request.headers.get('x-forwarded-host') or request.headers.get('host') or ''
+        base = f"{proto}://{host}" if host else BASE_URL
+        redirect_uri = f"{base}/api/auth/google/callback"
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                token_resp = await client.post('https://oauth2.googleapis.com/token', data={
+                    'code': code,
+                    'client_id': client_id,
+                    'client_secret': client_secret,
+                    'redirect_uri': redirect_uri,
+                    'grant_type': 'authorization_code'
+                })
+                if token_resp.status_code != 200:
+                    return Response(content=f"<script>alert('Gagal pertukaran token Google: {token_resp.text}'); location.href='/';</script>", media_type="text/html")
+                tokens = token_resp.json()
+                userinfo_resp = await client.get('https://www.googleapis.com/oauth2/v3/userinfo', headers={
+                    'Authorization': f"Bearer {tokens.get('access_token')}"
+                })
+                if userinfo_resp.status_code != 200:
+                    return Response(content="<script>alert('Gagal mengambil data akun Google.'); location.href='/';</script>", media_type="text/html")
+                profile = userinfo_resp.json()
+        except Exception as e:
+            return Response(content=f"<script>alert('Gangguan koneksi Google: {str(e)}'); location.href='/';</script>", media_type="text/html")
+
+        email = profile.get('email')
+        name = profile.get('name') or profile.get('given_name') or (email.split('@')[0] if email else '')
+        google_id = profile.get('sub')
+        avatar_url = profile.get('picture')
+
+        from fastapi.responses import RedirectResponse
+        redir = RedirectResponse(url='/', status_code=302)
+        with db.transaction(unscoped=True) as conn:
+            _login_or_register_google_user(conn, email, name, google_id, avatar_url, redir)
+        return redir
 
     @app.post('/api/auth/google')
     def google_auth(request: Request, response: Response, body: dict = Body(...)):
@@ -310,69 +421,9 @@ def install(app):
         if not email or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
             raise HTTPException(422, 'Email Google valid diperlukan.')
 
-        email = email.lower()
-        name = name or email.split('@')[0].capitalize()
-
         with db.transaction(unscoped=True) as conn:
-            user = db.one(conn, db.users, db.users.c.email == email)
-            if not user:
-                user_id = db.uid()
-                user = {
-                    'id': user_id,
-                    'name': name,
-                    'email': email,
-                    'password_hash': password_hash(secrets.token_urlsafe(32)),
-                    'roles': ['Owner'],
-                    'active': True,
-                    'verified': True,
-                    'platform_admin': False
-                }
-                user_record = {**user, 'google_id': google_id, 'avatar_url': avatar_url}
-                # insert only columns that exist
-                insert_data = {k: v for k, v in user_record.items() if k in db.users.c}
-                conn.execute(db.users.insert().values(**insert_data))
-                org_display_name = f"Workspace {name.split()[0]}" if name else "Workspace Utama"
-                org = create_org(conn, user, org_display_name)
-                membership = {'tenant_id': org['id'], 'roles': ['Owner']}
-            else:
-                update_vals = {'verified': True, 'active': True}
-                if 'google_id' in db.users.c and google_id:
-                    update_vals['google_id'] = google_id
-                if 'avatar_url' in db.users.c and avatar_url:
-                    update_vals['avatar_url'] = avatar_url
-                conn.execute(db.users.update().where(db.users.c.id == user['id']).values(**update_vals))
-                membership = conn.execute(db.memberships.select().where(db.memberships.c.user_id == user['id'], db.memberships.c.active == True).limit(1)).mappings().first()
-                if not membership:
-                    org = create_org(conn, user, f"Workspace {user['name'].split()[0] if user['name'] else 'Poko'}")
-                    membership = {'tenant_id': org['id'], 'roles': ['Owner']}
-                else:
-                    org = db.one(conn, db.organizations, db.organizations.c.id == membership['tenant_id'])
+            return _login_or_register_google_user(conn, email, name, google_id, avatar_url, response)
 
-            token = secrets.token_urlsafe(48)
-            conn.execute(db.sessions.insert().values(
-                id=hashlib.sha256(token.encode()).hexdigest(),
-                user_id=user['id'],
-                tenant_id=membership['tenant_id'],
-                last_seen=now(),
-                expires=(datetime.now(timezone.utc)+timedelta(days=7)).isoformat()
-            ))
-            conn.execute(db.platform_audit.insert().values(
-                id=db.uid(),
-                actor=user['name'],
-                tenant_id=membership['tenant_id'],
-                type='login_google',
-                reason='Login Google terverifikasi',
-                created_at=now(),
-                payload={'email': email, 'google_id': google_id}
-            ))
-
-            response.set_cookie('poko_session', token, httponly=True, samesite='strict', secure=os.getenv('COOKIE_SECURE') == '1', max_age=604800)
-            return {
-                **public_user(user),
-                'roles': membership['roles'] if membership else ['Owner'],
-                'tenant_id': org['id'] if org else None,
-                'organization_name': org['name'] if org else ''
-            }
 
     @app.post('/api/billing/sandbox-upgrade')
     def sandbox_upgrade(body: dict = Body(...), user=Depends(owner)):

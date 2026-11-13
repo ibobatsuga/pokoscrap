@@ -406,25 +406,19 @@ document.addEventListener('click',async event=>{const el=event.target.closest('[
         const gConf=await api('/auth/google/url');
         if(gConf.configured&&gConf.auth_url){location.href=gConf.auth_url;return;}
       }catch(err){}
-      modal('Masuk dengan Akun Google', `
+      modal('Konfigurasi Google OAuth', `
         <div style="text-align: center; margin-bottom: 16px;">
           ${googleIcon}
-          <h3 style="margin-top: 10px; font-size: 15px;">Lanjutkan dengan Akun Google</h3>
-          <p class="small">Pilih atau masukkan email Google untuk masuk ke workspace produksi PokoScrap.</p>
+          <h3 style="margin-top: 10px; font-size: 15px;">Google OAuth Memerlukan Client ID</h3>
+          <p class="small" style="line-height: 1.5; margin-top: 8px;">
+            Untuk login otomatis menggunakan akun Google resmi Anda, masukkan <b>GOOGLE_CLIENT_ID</b> dan <b>GOOGLE_CLIENT_SECRET</b> dari Google Cloud Console ke Environment Variables Vercel.
+          </p>
         </div>
-        <form id="google-quick-form">
-          <div class="field">
-            <label for="google-email">Email Google</label>
-            <input id="google-email" name="email" type="email" required value="owner@pokoscrap.com" placeholder="nama@gmail.com">
-          </div>
-          <div class="field">
-            <label for="google-name">Nama Profil</label>
-            <input id="google-name" name="name" required value="Owner PokoScrap" placeholder="Nama Anda">
-          </div>
-          <button class="button primary" style="width: 100%; min-height: 42px; margin-top: 10px;" type="submit">
-            ${icon('check')} Masuk sebagai Akun Google
-          </button>
-        </form>
+        <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 14px;">
+          <small style="color: #6b7280; display: block; margin-bottom: 4px; font-weight: 600;">Authorized Redirect URI untuk Google Console:</small>
+          <code style="word-break: break-all; font-size: 12px; color: #111827;">${location.origin}/api/auth/google/callback</code>
+        </div>
+        <button class="button primary" style="width: 100%; min-height: 40px;" data-action="close-modal" type="button">Mengerti</button>
       `);
       return;
     }
