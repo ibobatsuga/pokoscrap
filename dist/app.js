@@ -46,7 +46,6 @@ function shell(content,title){
           <div class="brand-name">PokoScrap</div>
           <small>by FLUXY.ID</small>
         </div>
-        <button class="icon-button mobile-close" data-action="menu-close" aria-label="Tutup menu">${icon('close')}</button>
       </a>
       <nav>
         <div class="nav-label">Discovery & Scraping</div>
